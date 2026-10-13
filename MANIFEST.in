@@ -1,0 +1,13 @@
+include LICENSE CMakeLists.txt requirements-dev.txt .gitignore .gitattributes
+include worker/third_party/nlohmann/LICENSE
+recursive-include .github *.yml
+recursive-include saga *.py
+recursive-include agent_backend *.py
+recursive-include worker *.cpp *.hpp
+recursive-include cmake *.in
+recursive-include user_configs *.json
+recursive-include templates *.json *.jsonl
+recursive-include experiments *.py
+recursive-include tests *.py
+prune docs
+global-exclude *.md *.rst

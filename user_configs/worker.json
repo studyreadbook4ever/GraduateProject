@@ -1,0 +1,8 @@
+{
+  "provider_url": "https://127.0.0.1:8443",
+  "ca_certificate": "/absolute/private/ca.pem",
+  "client_certificate": "/absolute/private/agent.pem",
+  "client_key": "/absolute/private/agent-key.pem",
+  "provider_public_key": "/absolute/private/provider-public-key.pem",
+  "agent_id": "agent-1"
+}

@@ -1,0 +1,1 @@
+{"task_id":"report","format":"canonical","call":{"tool":"read_file","arguments":{"resource":"notes"}}}

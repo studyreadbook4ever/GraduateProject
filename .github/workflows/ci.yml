@@ -1,0 +1,29 @@
+name: build-and-test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libssl-dev libcurl4-openssl-dev libsqlite3-dev
+          python -m pip install -e '.[test]' build
+      - name: Build C++ library and worker
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build
+      - name: Test Provider and available kernel integration
+        run: python -m pytest -q
+      - name: Build Python distribution
+        run: python -m build
+
+# Kernel tests require a real ABI9 host. Hosted CI explicitly skips those tests
+# when its host kernel does not provide the required sandbox features.

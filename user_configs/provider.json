@@ -1,0 +1,15 @@
+{
+  "agents": {
+    "agent-1": {
+      "certificate_sha256": "REPLACE_WITH_SHA256_OF_CLIENT_CERTIFICATE_DER",
+      "tasks": ["report"]
+    }
+  },
+  "tasks": {
+    "report": {"allow": [{"tool": "read_file", "resource": "notes"}]}
+  },
+  "resources": {
+    "notes": {"kind": "file", "path": "/absolute/path/to/existing/notes.txt"}
+  },
+  "token_ttl_seconds": 60
+}
