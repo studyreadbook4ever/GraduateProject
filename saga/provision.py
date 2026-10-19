@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+from .config import path_string
 from .jsonutil import dumps
 
 
@@ -56,7 +57,9 @@ def provision(directory: str | Path, provider_port: int = 8443, http_port: int =
     The CA key stays here for test enrollment only. Production operators should
     use an existing certificate authority and their normal key-management flow.
     """
-    directory = Path(directory).absolute()
+    directory = Path(path_string(directory, "provisioning directory")).absolute()
+    if any(type(port) is not int or not 1 <= port <= 65535 for port in (provider_port, http_port)):
+        raise ValueError("ports must be integers between 1 and 65535")
     if any(path.is_symlink() for path in [directory, *directory.parents]):
         raise ValueError("provisioning directory must not contain symlinks")
     if directory.exists():
@@ -65,8 +68,6 @@ def provision(directory: str | Path, provider_port: int = 8443, http_port: int =
     else:
         directory.mkdir(mode=0o700, parents=True)
     os.chmod(directory, 0o700)
-    if not 1 <= provider_port <= 65535 or not 1 <= http_port <= 65535:
-        raise ValueError("ports must be between 1 and 65535")
     ca_key = Ed25519PrivateKey.generate()
     ca_cert = _certificate("SAGA development CA", ca_key, _name("SAGA development CA"), ca_key, ca=True)
     _write_key(directory / "ca-key.pem", ca_key)

@@ -8,6 +8,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        shared: ['OFF', 'ON']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,9 +22,25 @@ jobs:
           sudo apt-get install -y cmake ninja-build libssl-dev libcurl4-openssl-dev libsqlite3-dev
           python -m pip install -e '.[test]' build
       - name: Build C++ library and worker
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=${{ matrix.shared }} && cmake --build build
       - name: Test Provider and available kernel integration
         run: python -m pytest -q
+      - name: Test native host boundary on compatible kernels
+        run: |
+          if build/saga-worker --probe; then
+            ctest --test-dir build --output-on-failure
+          fi
+      - name: Build installed CMake consumer
+        run: |
+          cmake --install build --prefix "$RUNNER_TEMP/saga-install"
+          cmake -S examples/cpp -B "$RUNNER_TEMP/saga-consumer" -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/saga-install"
+          cmake --build "$RUNNER_TEMP/saga-consumer"
+          python - "$RUNNER_TEMP/saga-install/bin/saga-worker" <<'PY'
+          import json, subprocess, sys
+          result = subprocess.run([sys.argv[1], "--probe"], capture_output=True, env={})
+          probe = json.loads(result.stdout)
+          assert result.returncode == (0 if probe["supported"] else 1)
+          PY
       - name: Build Python distribution
         run: python -m build
 

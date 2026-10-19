@@ -1,18 +1,25 @@
 #include <saga/worker.hpp>
 #include "internal.hpp"
+#ifndef SAGA_EXECUTOR_ONLY
+#include "executor_image.hpp"
+#endif
 
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <fcntl.h>
+#include <link.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/landlock.h>
+#include <linux/memfd.h>
 #include <linux/openat2.h>
 #include <linux/seccomp.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
 #include <sqlite3.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -25,15 +32,22 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <cstdlib>
-#include <functional>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#ifndef MFD_EXEC
+#define MFD_EXEC 0x0010U
+#endif
+#ifndef MFD_NOEXEC_SEAL
+#define MFD_NOEXEC_SEAL 0x0008U
+#endif
 
 #ifndef LANDLOCK_ACCESS_FS_RESOLVE_UNIX
 #define LANDLOCK_ACCESS_FS_RESOLVE_UNIX (1ULL << 16)
@@ -104,7 +118,7 @@ int open_regular(const std::string& path, int flags) {
     return descriptor;
 }
 
-void install_landlock(const Json& sandbox) {
+[[maybe_unused]] void install_landlock(const Json& sandbox) {
     if (landlock_abi() < 9) throw std::runtime_error("Landlock ABI >= 9 is required");
     RulesetAttributes attributes{};
     attributes.handled_access_fs = (1ULL << 17) - 1;
@@ -141,7 +155,7 @@ void install_landlock(const Json& sandbox) {
         fail_system("restrict process with Landlock");
 }
 
-void install_seccomp() {
+[[maybe_unused]] void install_seccomp() {
 #if defined(__x86_64__)
     constexpr unsigned int architecture = AUDIT_ARCH_X86_64;
 #elif defined(__aarch64__)
@@ -261,12 +275,80 @@ void install_seccomp() {
         fail_system("install seccomp filter");
 }
 
-void close_inherited_descriptors(int keep) {
-    // close_range is available on every kernel able to provide Landlock ABI9.
-    if (keep > 0 && syscall(SYS_close_range, 0U, static_cast<unsigned int>(keep - 1), 0U) < 0)
-        fail_system("close inherited descriptors");
-    if (syscall(SYS_close_range, static_cast<unsigned int>(keep + 1), ~0U, 0U) < 0)
-        fail_system("close inherited descriptors");
+Json failure(const char* code, const char* phase, const char* message) {
+    return {{"ok", false}, {"error_code", code}, {"phase", phase}, {"error", message}};
+}
+
+#ifndef SAGA_EXECUTOR_ONLY
+// Every retained descriptor is relocated before fork so the fixed child slots
+// can be overwritten without accidentally clobbering another retained handle.
+int relocate(int descriptor) {
+    const int result = fcntl(descriptor, F_DUPFD_CLOEXEC, 6);
+    const int saved = errno;
+    close(descriptor);
+    if (result < 0) { errno = saved; fail_system("reserve executor descriptor"); }
+    return result;
+}
+
+int sealed_memfd(const char* name, const char* bytes, std::size_t size, bool executable) {
+    // RLIMIT_FSIZE also applies to memfds. A coordinator may inherit a small
+    // limit from its host; detect that before write() can deliver SIGXFSZ to
+    // the embedding application instead of returning an execution failure.
+    rlimit limit{};
+    if (getrlimit(RLIMIT_FSIZE, &limit) < 0) fail_system("inspect coordinator file-size limit");
+    if (limit.rlim_cur != RLIM_INFINITY && size > limit.rlim_cur)
+        throw std::runtime_error("executor image or request exceeds coordinator file-size limit");
+    const int raw = static_cast<int>(syscall(SYS_memfd_create, name,
+        MFD_CLOEXEC | MFD_ALLOW_SEALING | (executable ? MFD_EXEC : MFD_NOEXEC_SEAL)));
+    if (raw < 0) fail_system("create isolated executor image or request");
+    const Fd descriptor(relocate(raw));
+    std::size_t offset = 0;
+    while (offset < size) {
+        const auto count = write(descriptor.value, bytes + offset, size - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) fail_system("prepare executor image or request");
+        offset += static_cast<std::size_t>(count);
+    }
+    if (lseek(descriptor.value, 0, SEEK_SET) < 0 ||
+        fcntl(descriptor.value, F_ADD_SEALS, F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE) < 0)
+        fail_system("seal executor image or request");
+    const int result = fcntl(descriptor.value, F_DUPFD_CLOEXEC, 6);
+    if (result < 0) fail_system("retain sealed executor descriptor");
+    return result;
+}
+
+std::string executor_loader_environment() {
+    const auto address = reinterpret_cast<std::uintptr_t>(&sqlite3_open_v2);
+    struct Origin { std::uintptr_t address; bool main_image = false; } origin{address};
+    dl_iterate_phdr([](dl_phdr_info* image, std::size_t, void* context) {
+        auto& found = *static_cast<Origin*>(context);
+        if (image->dlpi_name && image->dlpi_name[0] != '\0') return 0;
+        for (ElfW(Half) index = 0; index < image->dlpi_phnum; ++index) {
+            const auto& segment = image->dlpi_phdr[index];
+            const auto start = static_cast<std::uintptr_t>(image->dlpi_addr + segment.p_vaddr);
+            if (segment.p_type == PT_LOAD && found.address >= start && found.address - start < segment.p_memsz) {
+                found.main_image = true;
+                return 1;
+            }
+        }
+        return 0;
+    }, &origin);
+    // A statically linked SQLite has no DSO directory to pass to the loader.
+    if (origin.main_image) return {};
+    Dl_info information{};
+    if (dladdr(reinterpret_cast<const void*>(address), &information) == 0 || !information.dli_fname)
+        throw std::runtime_error("cannot identify executor SQLite dependency");
+    const std::unique_ptr<char, decltype(&std::free)> canonical(realpath(information.dli_fname, nullptr), std::free);
+    if (!canonical) fail_system("resolve executor SQLite dependency");
+    const std::string path(canonical.get());
+    const auto slash = path.find_last_of('/');
+    if (slash == std::string::npos) throw std::runtime_error("executor dependency path must be absolute");
+    const auto directory = path.substr(0, slash == 0 ? 1 : slash);
+    // ld.so has no escaping for path separators and expands dollar tokens.
+    // Never reinterpret one trusted directory as multiple search locations.
+    if (directory.find_first_of(":;$") != std::string::npos)
+        throw std::runtime_error("executor dependency directory cannot be represented safely");
+    return "LD_LIBRARY_PATH=" + directory;
 }
 
 void ensure_single_threaded() {
@@ -283,79 +365,58 @@ void ensure_single_threaded() {
         throw std::runtime_error("sandbox coordinator requires default SIGCHLD handling");
 }
 
-Json in_child(const Json& sandbox, const std::function<Json()>& handler, bool* started = nullptr) {
+Json in_child(const Json& request, bool* started = nullptr) {
     ensure_single_threaded();
+    const auto document = request.dump();
+    if (document.size() > max_data) throw std::runtime_error("executor request too large");
+    const Fd image(sealed_memfd("saga-executor", embedded::image, sizeof(embedded::image) - 1, true));
+    const Fd input(sealed_memfd("saga-request", document.data(), document.size(), false));
+    const Fd neutral(relocate(open("/dev/null", O_RDWR | O_CLOEXEC)));
+    if (neutral.value < 0) fail_system("create neutral standard streams");
     int channel[2];
     if (pipe2(channel, O_CLOEXEC) < 0) fail_system("create child result pipe");
-    if (channel[1] < 3) {
-        const int relocated = fcntl(channel[1], F_DUPFD_CLOEXEC, 3);
-        if (relocated < 0) {
-            close(channel[0]); close(channel[1]);
-            fail_system("reserve executor result descriptor");
-        }
-        close(channel[1]);
-        channel[1] = relocated;
-    }
+    const Fd output(channel[0]);
+    Fd sender(relocate(channel[1]));
+    auto loader_setting = executor_loader_environment();
+    char* environment[] = {loader_setting.empty() ? nullptr : loader_setting.data(), nullptr};
     const pid_t coordinator = getpid();
     const pid_t child = fork();
-    if (child < 0) { close(channel[0]); close(channel[1]); fail_system("fork executor"); }
+    if (child < 0) fail_system("fork executor");
     if (child == 0) {
-        Json result;
-        try {
-            if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0) fail_system("set executor parent death signal");
-            if (getppid() != coordinator) _exit(125);
-            // A library host's signal callbacks must not become extra executor
-            // handlers, and a blocked host mask must not defeat resource limits.
-            struct sigaction default_action{};
-            default_action.sa_handler = SIG_DFL;
-            sigemptyset(&default_action.sa_mask);
-            for (int number = 1; number < NSIG; ++number) {
-                if (number == SIGKILL || number == SIGSTOP) continue;
-                if (sigaction(number, &default_action, nullptr) < 0 && errno != EINVAL)
-                    fail_system("reset executor signal handling");
-            }
-            sigset_t empty_mask;
-            sigemptyset(&empty_mask);
-            if (sigprocmask(SIG_SETMASK, &empty_mask, nullptr) < 0) fail_system("clear executor signal mask");
-            if (clearenv() != 0) fail_system("clear executor environment");
-            if (chdir("/") < 0) fail_system("reset executor working directory");
-            close_inherited_descriptors(channel[1]);
-            // SQLite deliberately avoids opening a database on fd 0/1/2.
-            // Recreate neutral standard streams after discarding inherited
-            // ones, before Landlock denies access to all ungranted files.
-            const Fd neutral(open("/dev/null", O_RDWR | O_CLOEXEC));
-            if (neutral.value < 0) fail_system("create neutral standard streams");
-            for (int stream = 0; stream < 3; ++stream)
-                if (dup2(neutral.value, stream) < 0) fail_system("reserve standard stream");
-            const rlimit cpu{5, 5};
-            const rlimit memory{512 * 1024 * 1024, 512 * 1024 * 1024};
-            const rlimit files{max_data, max_data};
-            const rlimit core{0, 0};
-            if (setrlimit(RLIMIT_CPU, &cpu) < 0 || setrlimit(RLIMIT_AS, &memory) < 0 ||
-                setrlimit(RLIMIT_FSIZE, &files) < 0 || setrlimit(RLIMIT_CORE, &core) < 0)
-                fail_system("set executor resource limits");
-            install_landlock(sandbox);
-            install_seccomp();
-            result = {{"ok", true}, {"result", handler()}};
-        } catch (const std::exception& error) {
-            result = {{"ok", false}, {"error", error.what()}};
+        // This branch runs only trusted setup. No capability parser or handler
+        // sees the inherited address space: success must replace it with exec.
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != coordinator) _exit(125);
+        struct sigaction default_action{};
+        default_action.sa_handler = SIG_DFL;
+        sigemptyset(&default_action.sa_mask);
+        for (int number = 1; number < NSIG; ++number) {
+            if (number == SIGKILL || number == SIGSTOP) continue;
+            if (sigaction(number, &default_action, nullptr) < 0 && errno != EINVAL) _exit(126);
         }
-        std::string encoded;
-        try { encoded = result.dump(); }
-        catch (...) { encoded = "{\"ok\":false,\"error\":\"cannot serialize executor result\"}"; }
-        if (encoded.size() > max_data)
-            encoded = "{\"ok\":false,\"error\":\"executor result too large\"}";
-        std::size_t offset = 0;
-        while (offset < encoded.size()) {
-            const auto written = write(channel[1], encoded.data() + offset, encoded.size() - offset);
-            if (written < 0 && errno == EINTR) continue;
-            if (written <= 0) break;
-            offset += static_cast<std::size_t>(written);
-        }
-        _exit(0);
+        sigset_t empty_mask;
+        sigemptyset(&empty_mask);
+        if (sigprocmask(SIG_SETMASK, &empty_mask, nullptr) < 0 || chdir("/") < 0) _exit(126);
+        if (dup3(input.value, 3, 0) < 0 || dup3(sender.value, 4, 0) < 0 ||
+            dup3(image.value, 5, O_CLOEXEC) < 0) _exit(126);
+        for (int stream = 0; stream < 3; ++stream)
+            if (dup2(neutral.value, stream) < 0) _exit(126);
+        if (syscall(SYS_close_range, 6U, ~0U, 0U) < 0) _exit(126);
+        const rlimit cpu{5, 5};
+        const rlimit memory{512 * 1024 * 1024, 512 * 1024 * 1024};
+        const rlimit files{max_data, max_data};
+        const rlimit core{0, 0};
+        if (setrlimit(RLIMIT_CPU, &cpu) < 0 || setrlimit(RLIMIT_AS, &memory) < 0 ||
+            setrlimit(RLIMIT_FSIZE, &files) < 0 || setrlimit(RLIMIT_CORE, &core) < 0 ||
+            prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) _exit(126);
+        char name[] = "saga-executor";
+        char* argv[] = {name, nullptr};
+        syscall(SYS_execveat, 5, "", argv, environment, AT_EMPTY_PATH);
+        _exit(127);
     }
     if (started) *started = true;
-    close(channel[1]);
+    // Only the child may retain the result pipe writer.
+    close(sender.value);
+    sender.value = -1;
     struct ChildGuard {
         pid_t pid;
         bool reaped = false;
@@ -367,7 +428,6 @@ Json in_child(const Json& sandbox, const std::function<Json()>& handler, bool* s
             }
         }
     } child_guard{child};
-    const Fd output(channel[0]);
     std::string encoded;
     std::array<char, 8192> buffer{};
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -390,20 +450,37 @@ Json in_child(const Json& sandbox, const std::function<Json()>& handler, bool* s
     }
     if (timed_out || oversized || read_failed) kill(child, SIGKILL);
     int status = 0;
-    while (waitpid(child, &status, 0) < 0) {
-        if (errno != EINTR) {
+    for (;;) {
+        const pid_t reaped = waitpid(child, &status, WNOHANG);
+        if (reaped == child) break;
+        if (reaped < 0 && errno != EINTR) {
             if (errno == ECHILD) child_guard.reaped = true;
             fail_system("reap executor");
         }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            timed_out = true;
+            kill(child, SIGKILL);
+        }
+        poll(nullptr, 0, 10);
     }
     child_guard.reaped = true;
-    if (timed_out) throw std::runtime_error("executor exceeded 10 second time limit");
-    if (oversized) throw std::runtime_error("executor result too large");
-    if (read_failed) throw std::runtime_error("executor result channel failed");
+    if (timed_out) return failure("executor_timeout", "execution", "executor exceeded time limit");
+    if (oversized) return failure("executor_result_too_large", "execution", "executor result too large");
+    if (read_failed) return failure("executor_channel_failed", "execution", "executor result channel failed");
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-        throw std::runtime_error("executor terminated before completion");
-    return Json::parse(encoded);
+        return failure("executor_terminated", "execution", "executor terminated before completion");
+    try {
+        const auto result = Json::parse(encoded);
+        if (!result.is_object() || !result.contains("ok") || !result.at("ok").is_boolean() ||
+            (result.at("ok").get<bool>() ? !result.contains("result") :
+                !result.contains("error_code") || !result.at("error_code").is_string()))
+            return failure("executor_protocol_failed", "execution", "executor returned an invalid result");
+        return result;
+    } catch (...) {
+        return failure("executor_protocol_failed", "execution", "executor returned an invalid result");
+    }
 }
+#endif
 
 std::string read_file(const std::string& path) {
     const Fd input(open_regular(path, O_RDONLY));
@@ -527,7 +604,13 @@ Json query_db(const Json& execution, const Json& arguments) {
             switch (sqlite3_column_type(statement.get(), column)) {
                 case SQLITE_NULL: row.push_back(nullptr); break;
                 case SQLITE_INTEGER: row.push_back(sqlite3_column_int64(statement.get(), column)); break;
-                case SQLITE_FLOAT: row.push_back(sqlite3_column_double(statement.get(), column)); break;
+                case SQLITE_FLOAT: {
+                    const auto value = sqlite3_column_double(statement.get(), column);
+                    if (!std::isfinite(value))
+                        throw std::runtime_error("nonfinite SQL results cannot be represented as JSON numbers");
+                    row.push_back(value);
+                    break;
+                }
                 case SQLITE_TEXT: {
                     const auto* bytes = sqlite3_column_text(statement.get(), column);
                     row.push_back(std::string(reinterpret_cast<const char*>(bytes),
@@ -619,6 +702,94 @@ int connect_tcp(const std::string& host, std::uint16_t port, int family) {
     return connection;
 }
 
+Json http_response(const std::string& response) {
+    std::size_t start = 0;
+    // Informational responses precede the final response, never its body.
+    for (unsigned int informational = 0; informational <= 16; ++informational) {
+        const auto end = response.find("\r\n\r\n", start);
+        const auto line_end = response.find("\r\n", start);
+        if (end == std::string::npos || line_end == std::string::npos || end - start > 65536)
+            throw std::runtime_error("invalid HTTP response headers");
+        const auto line = response.substr(start, line_end - start);
+        if (line.size() < 13 || (line.compare(0, 8, "HTTP/1.0") != 0 && line.compare(0, 8, "HTTP/1.1") != 0) ||
+            line[8] != ' ' || line[12] != ' ' || line.substr(9, 3).find_first_not_of("0123456789") != std::string::npos)
+            throw std::runtime_error("invalid HTTP status line");
+        for (std::size_t index = 13; index < line.size(); ++index) {
+            const auto character = static_cast<unsigned char>(line[index]);
+            if ((character < 32 && character != '\t') || character == 127)
+                throw std::runtime_error("invalid HTTP reason phrase");
+        }
+        const int status = (line[9] - '0') * 100 + (line[10] - '0') * 10 + line[11] - '0';
+        if (status < 100 || status > 599 || status == 101)
+            throw std::runtime_error("unsupported HTTP status");
+        bool has_length = false;
+        std::size_t content_length = 0;
+        for (auto cursor = line_end + 2; cursor < end;) {
+            const auto next = response.find("\r\n", cursor);
+            if (next == std::string::npos || next > end)
+                throw std::runtime_error("invalid HTTP header line");
+            const auto header = response.substr(cursor, next - cursor);
+            const auto colon = header.find(':');
+            if (colon == std::string::npos || colon == 0 ||
+                header.substr(0, colon).find_first_not_of("!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz") != std::string::npos)
+                throw std::runtime_error("invalid HTTP header name");
+            for (std::size_t index = colon + 1; index < header.size(); ++index) {
+                const auto character = static_cast<unsigned char>(header[index]);
+                if ((character < 32 && character != '\t') || character == 127)
+                    throw std::runtime_error("invalid HTTP header value");
+            }
+            auto name = header.substr(0, colon);
+            for (char& character : name)
+                if (character >= 'A' && character <= 'Z') character += 'a' - 'A';
+            if (name == "transfer-encoding")
+                throw std::runtime_error("HTTP transfer encoding is unsupported by this registered handler");
+            if (name == "content-length") {
+                const auto value = header.substr(colon + 1);
+                std::size_t item = 0;
+                for (;;) {
+                    const auto comma = value.find(',', item);
+                    const auto part = value.substr(item, comma == std::string::npos ? comma : comma - item);
+                    const auto first = part.find_first_not_of(" \t");
+                    const auto last = part.find_last_not_of(" \t");
+                    if (first == std::string::npos)
+                        throw std::runtime_error("empty HTTP content length");
+                    std::size_t length = 0;
+                    for (auto index = first; index <= last; ++index) {
+                        const auto character = part[index];
+                        const auto maximum = status == 304 ? std::numeric_limits<std::size_t>::max() : max_content;
+                        if (character < '0' || character > '9' ||
+                            length > (maximum - static_cast<std::size_t>(character - '0')) / 10)
+                            throw std::runtime_error("invalid or excessive HTTP content length");
+                        length = length * 10 + static_cast<std::size_t>(character - '0');
+                    }
+                    if (has_length && content_length != length)
+                        throw std::runtime_error("conflicting HTTP content lengths");
+                    content_length = length;
+                    has_length = true;
+                    if (comma == std::string::npos) break;
+                    item = comma + 1;
+                }
+            }
+            cursor = next + 2;
+        }
+        const auto body_start = end + 4;
+        if (status < 200) {
+            if (has_length) throw std::runtime_error("informational response has a content length");
+            start = body_start;
+            continue;
+        }
+        const auto actual_length = response.size() - body_start;
+        if (status == 204 || status == 304) {
+            if (actual_length != 0 || (status == 204 && has_length))
+                throw std::runtime_error("body forbidden for HTTP status");
+        } else if ((has_length && actual_length != content_length) || (status == 205 && actual_length != 0)) {
+            throw std::runtime_error("incomplete or excessive HTTP response body");
+        }
+        return {{"status", status}, {"body", response.substr(body_start)}};
+    }
+    throw std::runtime_error("too many informational HTTP responses");
+}
+
 Json http_get(const std::string& url) {
     const auto target = parse_http(url);
     const Fd connection(connect_tcp(target.host, target.port, target.family));
@@ -643,18 +814,7 @@ Json http_get(const std::string& url) {
             throw std::runtime_error("HTTP response exceeds 1 MiB limit");
         response.append(buffer.data(), static_cast<std::size_t>(count));
     }
-    const auto end = response.find("\r\n\r\n");
-    const auto space = response.find(' ');
-    if (response.rfind("HTTP/1.", 0) != 0 || end == std::string::npos || space == std::string::npos || space > 12 ||
-        response.size() < space + 4 || response.substr(space + 1, 3).find_first_not_of("0123456789") != std::string::npos)
-        throw std::runtime_error("invalid HTTP response");
-    const int status = std::stoi(response.substr(space + 1, 3));
-    const auto headers = response.substr(0, end);
-    std::string lower = headers;
-    for (char& character : lower) character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
-    if (lower.find("transfer-encoding:") != std::string::npos)
-        throw std::runtime_error("HTTP transfer encoding is unsupported by this registered handler");
-    return {{"status", status}, {"body", response.substr(end + 4)}};
+    return http_response(response);
 }
 
 Json capability_sandbox(const Json& capability) {
@@ -694,7 +854,7 @@ Json capability_sandbox(const Json& capability) {
     return expected;
 }
 
-Json probe_attempt(const Json& attempt) {
+[[maybe_unused]] Json probe_attempt(const Json& attempt) {
     const auto kind = text(attempt, "kind");
     int status = -1;
     errno = 0;
@@ -753,33 +913,106 @@ Json probe_attempt(const Json& attempt) {
         char* argv[] = {program, nullptr};
         char* env[] = {nullptr};
         status = execve(program, argv, env);
+    } else if (kind == "memory_mapping") {
+        const auto& raw_address = attempt.at("address");
+        if (!raw_address.is_number_integer() ||
+            (!raw_address.is_number_unsigned() && raw_address.get<std::int64_t>() < 0))
+            throw std::runtime_error("invalid probe memory address");
+        const auto address = raw_address.get<std::uint64_t>();
+        const auto page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+        if (address == 0 || address > std::numeric_limits<std::uintptr_t>::max() || address % page != 0)
+            throw std::runtime_error("unaligned probe memory address");
+        unsigned char resident = 0;
+        status = mincore(reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)),
+            static_cast<std::size_t>(page), &resident);
+    } else if (kind == "descriptor") {
+        status = fcntl(attempt.at("fd").get<int>(), F_GETFD);
+    } else if (kind == "environment") {
+        status = std::getenv(text(attempt, "name").c_str()) ? 0 : -1;
+        if (status < 0) errno = ENOENT;
     } else throw std::runtime_error("unregistered probe operation");
     const int error = status < 0 ? errno : 0;
     return {{"kind", kind}, {"ok", status >= 0}, {"errno", error}};
 }
 }
 
+Json run_handler(const Json& capability) {
+    const auto tool = text(capability, "tool");
+    const auto& execution = capability.at("execution");
+    const auto& arguments = capability.at("arguments");
+    if (tool == "read_file") return Json{{"content", read_file(text(execution, "path"))}};
+    if (tool == "write_file") return write_file(text(execution, "path"), arguments.at("content").get<std::string>());
+    if (tool == "query_db") return query_db(execution, arguments);
+    return http_get(text(execution, "url"));
+}
+
+#ifdef SAGA_EXECUTOR_ONLY
+int executor_main() noexcept {
+    // exec resets dumpable. Set it again before accepting any request data.
+    // The only possible initial environment value is the coordinator-selected
+    // SQLite DSO directory used by the loader. Handlers receive no environment.
+    if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) < 0 || clearenv() != 0) return 126;
+    Json result;
+    const char* phase = "sandbox_setup";
+    try {
+        std::string document;
+        std::array<char, 8192> buffer{};
+        for (;;) {
+            const auto count = read(3, buffer.data(), buffer.size());
+            if (count < 0 && errno == EINTR) continue;
+            if (count < 0) throw std::runtime_error("request channel failed");
+            if (count == 0) break;
+            if (static_cast<std::size_t>(count) > max_data - document.size())
+                throw std::runtime_error("request too large");
+            document.append(buffer.data(), static_cast<std::size_t>(count));
+        }
+        close(3);
+        const auto request = Json::parse(document);
+        const auto mode = text(request, "mode");
+        const auto& data = request.at("data");
+        const auto sandbox = mode == "execute" ? capability_sandbox(data) : data.at("sandbox");
+        if (mode != "execute" && mode != "probe") throw std::runtime_error("invalid executor mode");
+        install_landlock(sandbox);
+        install_seccomp();
+        phase = "execution";
+        Json output;
+        if (mode == "execute") output = run_handler(data);
+        else {
+            Json attempts = Json::array();
+            if (!data.at("attempts").is_array() || data.at("attempts").size() > 100)
+                throw std::runtime_error("probe requires at most 100 attempts");
+            for (const auto& attempt : data.at("attempts")) attempts.push_back(probe_attempt(attempt));
+            output = {{"attempts", attempts}};
+        }
+        result = {{"ok", true}, {"result", output}};
+    } catch (...) {
+        result = std::strcmp(phase, "execution") == 0
+            ? failure("execution_failed", "execution", "registered handler execution failed")
+            : failure("sandbox_setup_failed", "sandbox_setup", "executor sandbox setup failed");
+    }
+    std::string encoded;
+    try { encoded = result.dump(); }
+    catch (...) { return 126; }
+    if (encoded.size() > max_data)
+        encoded = R"({"ok":false,"error_code":"executor_result_too_large","phase":"execution","error":"executor result too large"})";
+    std::size_t offset = 0;
+    while (offset < encoded.size()) {
+        const auto count = write(4, encoded.data() + offset, encoded.size() - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return 126;
+        offset += static_cast<std::size_t>(count);
+    }
+    close(4);
+    return 0;
+}
+#else
 Json execute_child(const Json& capability, bool& executor_started) {
-    const auto sandbox = capability_sandbox(capability);
-    return in_child(sandbox, [&] {
-        const auto tool = text(capability, "tool");
-        const auto& execution = capability.at("execution");
-        const auto& arguments = capability.at("arguments");
-        if (tool == "read_file") return Json{{"content", read_file(text(execution, "path"))}};
-        if (tool == "write_file") return write_file(text(execution, "path"), arguments.at("content").get<std::string>());
-        if (tool == "query_db") return query_db(execution, arguments);
-        return http_get(text(execution, "url"));
-    }, &executor_started);
+    capability_sandbox(capability);
+    return in_child({{"mode", "execute"}, {"data", capability}}, &executor_started);
 }
 
 Json probe_child(const Json& specification) {
-    const auto result = in_child(specification.at("sandbox"), [&] {
-        Json attempts = Json::array();
-        if (!specification.at("attempts").is_array() || specification.at("attempts").size() > 100)
-            throw std::runtime_error("probe requires at most 100 attempts");
-        for (const auto& attempt : specification.at("attempts")) attempts.push_back(probe_attempt(attempt));
-        return Json{{"attempts", attempts}};
-    });
+    const auto result = in_child({{"mode", "probe"}, {"data", specification}});
     Json output = result;
     output["landlock_abi"] = landlock_abi();
     if (output.value("ok", false)) {
@@ -788,5 +1021,6 @@ Json probe_child(const Json& specification) {
     }
     return output;
 }
+#endif
 } // namespace detail
 } // namespace saga

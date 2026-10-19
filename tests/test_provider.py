@@ -1,7 +1,11 @@
 """Exercise revocation at the authority boundary, including races and restarts."""
 
 import copy
+import multiprocessing
+import os
 import sqlite3
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
@@ -403,3 +407,223 @@ def test_reenrolled_certificate_cannot_finish_original_execution(provider_env):
     original_enrollment = Provider(env["config"], env["state"], env["key"], clock=lambda: env["now"][0])
     original_enrollment.finish(ALICE, completion)
     assert restarted.rotate(replacement_fingerprint, rotate_body(1))["epoch"] == 2
+
+
+def test_explicit_revocation_fences_valid_signature_and_survives_restart(provider_env):
+    env = provider_env
+    p = env["provider"]
+    issued = p.rotate(ALICE, rotate_body())
+    assert p.revoke(ALICE, {"expected_epoch": 1}) == {"agent_id": "alice", "epoch": 2, "revoked": True}
+    # Revocation invalidates authority admission, not Ed25519 mathematics.
+    assert verify_token(issued["token"], env["key"].public_key())["epoch"] == 1
+    restarted = Provider(env["config"], env["state"], env["key"], clock=lambda: env["now"][0])
+    reject(403, lambda: restarted.admit(ALICE, {"token": issued["token"]}))
+    reject(409, lambda: restarted.revoke(ALICE, {"expected_epoch": 1}))
+    with sqlite3.connect(env["state"]) as db:
+        assert db.execute("SELECT epoch,current_jti FROM agents WHERE agent_id='alice'").fetchone() == (2, None)
+        assert db.execute("SELECT status FROM grants").fetchall() == [("REVOKED",)]
+        assert db.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 0
+    assert restarted.rotate(ALICE, rotate_body(2))["epoch"] == 3
+
+
+def test_revocation_is_per_certificate_and_refuses_live_execution(provider_env):
+    env = provider_env
+    p = env["provider"]
+    issued = p.rotate(ALICE, rotate_body())
+    assert p.revoke(BOB, {"expected_epoch": 0})["agent_id"] == "bob"
+    admission = p.admit(ALICE, {"token": issued["token"]})
+    env["now"][0] += 3600
+    restarted = Provider(env["config"], env["state"], env["key"], clock=lambda: env["now"][0])
+    reject(409, lambda: restarted.revoke(ALICE, {"expected_epoch": 1}))
+    assert restarted.state(ALICE)["epoch"] == 1
+    restarted.finish(ALICE, {"execution_id": admission["execution_id"], "outcome": "succeeded"})
+    assert restarted.revoke(ALICE, {"expected_epoch": 1})["epoch"] == 2
+
+
+@pytest.mark.parametrize("other_operation", ["admit", "rotate"])
+def test_revocation_serializes_against_admission_and_rotation(provider_env, other_operation):
+    env = provider_env
+    p = env["provider"]
+    independent = Provider(env["config"], env["state"], env["key"], clock=lambda: env["now"][0])
+    for _ in range(12):
+        issued = p.rotate(ALICE, rotate_body(p.state(ALICE)["epoch"]))
+        barrier = Barrier(2)
+
+        def revoke():
+            barrier.wait()
+            try:
+                return p.revoke(ALICE, {"expected_epoch": issued["epoch"]})
+            except ProviderError as error:
+                return error.status
+
+        def other():
+            barrier.wait()
+            try:
+                if other_operation == "admit":
+                    return independent.admit(ALICE, {"token": issued["token"]})
+                return independent.rotate(ALICE, rotate_body(issued["epoch"]))
+            except ProviderError as error:
+                return error.status
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first, second = pool.submit(revoke), pool.submit(other)
+            revoked, result = first.result(), second.result()
+        assert sum(isinstance(value, dict) for value in [revoked, result]) == 1
+        if isinstance(revoked, dict):
+            assert result == (403 if other_operation == "admit" else 409)
+        else:
+            assert revoked == 409
+            if other_operation == "admit":
+                assert p.state(ALICE)["epoch"] == issued["epoch"]
+                p.finish(ALICE, {"execution_id": result["execution_id"], "outcome": "succeeded"})
+
+
+@pytest.mark.parametrize("epoch", [True, -1, 2**63 - 1, "1", None])
+def test_revocation_rejects_invalid_generation(provider_env, epoch):
+    p = provider_env["provider"]
+    reject(400, lambda: p.revoke(ALICE, {"expected_epoch": epoch}))
+    assert p.state(ALICE)["epoch"] == 0
+
+
+def test_denials_and_rolled_back_internal_failures_are_durably_redacted(provider_env):
+    env = provider_env
+    p = env["provider"]
+    first = p.rotate(ALICE, rotate_body())
+    secret = "never-log-this-SQL-content-token-or-path"
+    reject(403, lambda: p.rotate(ALICE, rotate_body(1, "write_file", "private", content=secret)))
+    reject(403, lambda: p.admit(ALICE, {"token": secret}))
+    reject(403, lambda: p.state(secret))
+    with sqlite3.connect(env["state"]) as db:
+        db.execute("CREATE TRIGGER secret_failure BEFORE INSERT ON grants WHEN NEW.epoch > 1 BEGIN SELECT RAISE(ABORT, 'never-log-this-SQL-content-token-or-path'); END")
+    with pytest.raises(sqlite3.IntegrityError):
+        p.rotate(ALICE, rotate_body(1))
+    restarted = Provider(env["config"], env["state"], env["key"], clock=lambda: env["now"][0])
+    failures = restarted.failure_events(ALICE)
+    assert [(event["operation"], event["phase"], event["error_code"]) for event in failures] == [
+        ("rotate", "policy", "capability_denied"),
+        ("admit", "parsing", "invalid_token"),
+        ("rotate", "rotation", "internal_error"),
+    ]
+    with sqlite3.connect(env["state"]) as db:
+        all_failures = db.execute("SELECT * FROM request_failures").fetchall()
+        assert db.execute("SELECT agent_id FROM request_failures WHERE error_code='unknown_agent'").fetchone() == (None,)
+    assert secret not in repr(all_failures)
+    assert first["token"] not in repr(all_failures)
+    assert str(env["root"]) not in repr(all_failures)
+    assert all(len(event["request_id"]) == 32 and event["call_id"] is None for event in failures)
+    assert restarted.state(ALICE)["epoch"] == 1
+    assert restarted.admit(ALICE, {"token": first["token"]})["capability"]["resource"] == "notes"
+
+
+def test_audit_storage_failure_fails_closed_and_uses_redacted_emergency_log(provider_env, capsys):
+    env = provider_env
+    p = env["provider"]
+    issued = p.rotate(ALICE, rotate_body())
+    with sqlite3.connect(env["state"]) as db:
+        db.execute("CREATE TRIGGER no_audit BEFORE INSERT ON request_failures BEGIN SELECT RAISE(ABORT, 'SECRET storage path'); END")
+    with pytest.raises(ProviderError) as error:
+        p.rotate(ALICE, rotate_body(1, resource="private"))
+    assert (error.value.status, error.value.code) == (503, "audit_unavailable")
+    emergency = capsys.readouterr().err
+    assert '"event":"audit_unavailable"' in emergency
+    assert "SECRET" not in emergency and "private" not in emergency and issued["token"] not in emergency
+    assert p.state(ALICE)["epoch"] == 1
+    assert p.admit(ALICE, {"token": issued["token"]})["capability"]["resource"] == "notes"
+
+
+def test_transition_audit_failure_rolls_back_admission(provider_env):
+    env = provider_env
+    p = env["provider"]
+    issued = p.rotate(ALICE, rotate_body())
+    with sqlite3.connect(env["state"]) as db:
+        db.execute("CREATE TRIGGER no_admission_audit BEFORE INSERT ON audit_events WHEN NEW.event='admitted' BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END")
+    with pytest.raises(sqlite3.IntegrityError):
+        p.admit(ALICE, {"token": issued["token"]})
+    with sqlite3.connect(env["state"]) as db:
+        assert db.execute("SELECT status FROM grants").fetchall() == [("ACTIVE",)]
+        assert db.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 0
+    assert p.failure_events(ALICE)[-1]["error_code"] == "internal_error"
+
+
+def test_failed_completion_persists_safe_reason_and_exact_receipt(provider_env):
+    p = provider_env["provider"]
+    token = p.rotate(ALICE, rotate_body())["token"]
+    execution = p.admit(ALICE, {"token": token})["execution_id"]
+    body = {"execution_id": execution, "outcome": "failed", "failure_code": "execution_failed"}
+    assert p.finish(ALICE, body)["finished"] is True
+    p.finish(ALICE, body)
+    p.finish(ALICE, {"execution_id": execution, "outcome": "failed"})
+    reject(409, lambda: p.finish(ALICE, {**body, "failure_code": "worker_failed"}))
+    reject(400, lambda: p.finish(ALICE, {**body, "failure_code": "/private/path SQL SECRET"}))
+    finished = [event for event in p.audit_events(ALICE) if event["event"] == "finished"]
+    assert len(finished) == 1
+    assert (finished[0]["outcome"], finished[0]["failure_code"]) == ("failed", "execution_failed")
+    with sqlite3.connect(provider_env["state"]) as db:
+        assert db.execute("SELECT outcome,failure_code FROM executions").fetchone() == ("failed", "execution_failed")
+
+
+def test_existing_database_migrates_without_releasing_execution(provider_env):
+    env = provider_env
+    p = env["provider"]
+    token = p.rotate(ALICE, rotate_body())["token"]
+    execution = p.admit(ALICE, {"token": token})["execution_id"]
+    with sqlite3.connect(env["state"]) as db:
+        db.execute("DROP TABLE request_failures")
+        db.execute("DROP TABLE operations")
+        for column in ("request_id", "call_id", "outcome", "failure_code"):
+            db.execute(f"ALTER TABLE audit_events DROP COLUMN {column}")
+        db.execute("ALTER TABLE executions DROP COLUMN failure_code")
+        db.execute("ALTER TABLE executions DROP COLUMN receipt")
+    barrier = Barrier(8)
+
+    def restart(_):
+        barrier.wait()
+        return Provider(env["config"], env["state"], env["key"], clock=lambda: env["now"][0])
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        restarted = list(pool.map(restart, range(8)))[0]
+    reject(409, lambda: restarted.revoke(ALICE, {"expected_epoch": 1}))
+    restarted.finish(ALICE, {"execution_id": execution, "outcome": "failed", "failure_code": "worker_failed"})
+    assert restarted.revoke(ALICE, {"expected_epoch": 1})["epoch"] == 2
+
+
+def test_nonblocking_failure_audit_includes_connection_initialization(provider_env, capsys):
+    provider = provider_env["provider"]
+    with sqlite3.connect(provider_env["state"], isolation_level=None) as held:
+        held.execute("PRAGMA locking_mode=EXCLUSIVE")
+        held.execute("BEGIN EXCLUSIVE")
+        started = time.monotonic()
+        with pytest.raises(ProviderError) as error:
+            provider.record_failure(ProviderError(503, "server_busy", "capacity"), nonblocking=True)
+        assert time.monotonic() - started < 0.5
+        assert error.value.code == "audit_unavailable"
+        held.rollback()
+    assert "audit_unavailable" in capsys.readouterr().err
+
+
+def test_closed_emergency_stderr_preserves_server_failure_handling(provider_env):
+    from saga.provider.server import _Server
+
+    with sqlite3.connect(provider_env["state"]) as database:
+        database.execute("CREATE TRIGGER no_failure_audit BEFORE INSERT ON request_failures BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END")
+
+    def check():
+        reader, writer = os.pipe()
+        os.close(reader)
+        sys.stderr = os.fdopen(writer, "w", buffering=1)
+        server = _Server.__new__(_Server)
+        server.provider = provider_env["provider"]
+        try:
+            server._failure(ProviderError(503, "server_busy", "capacity"), nonblocking=True)
+        except BaseException:
+            os._exit(1)
+        os._exit(0)
+
+    process = multiprocessing.get_context("fork").Process(target=check)
+    process.start()
+    process.join(timeout=3)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=3)
+        pytest.fail("diagnostic pipe failure blocked cleanup")
+    assert process.exitcode == 0

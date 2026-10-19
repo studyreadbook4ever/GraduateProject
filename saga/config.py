@@ -3,6 +3,7 @@
 import copy
 import ipaddress
 import math
+import os
 import re
 import sqlite3
 from contextlib import closing
@@ -22,17 +23,42 @@ def identifier(value, label: str) -> str:
     return value
 
 
-def regular_path(value) -> str:
+def path_string(value, label: str = "path", *, allow_pathlike: bool = True) -> str:
+    """Validate path text before it reaches a filesystem or native API.
+
+    JSON policy paths remain strings; Python entry points may accept PathLike
+    objects that return strings. Bytes, null, empty names, embedded NUL and
+    unpaired surrogates have no supported interpretation at this boundary.
+    This validates a path, never file contents.
+    """
+    message = f"{label} must be nonempty UTF-8 path text without NUL"
+    if allow_pathlike and not isinstance(value, str):
+        try:
+            value = os.fspath(value)
+        except (TypeError, ValueError, UnicodeError):
+            raise ValueError(message) from None
     if not isinstance(value, str) or not value or "\x00" in value:
-        raise ValueError("resource path must be an absolute regular file")
+        raise ValueError(message)
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        raise ValueError(message) from None
+    return value
+
+
+def regular_path(value) -> str:
+    value = path_string(value, "resource path", allow_pathlike=False)
     path = Path(value)
     if not path.is_absolute() or str(path) != value or ".." in path.parts:
         raise ValueError("resource path must be normalized and absolute")
-    for component in [path, *path.parents]:
-        if component.is_symlink():
-            raise ValueError("resource path contains a symlink")
-    if not path.is_file():
-        raise ValueError("resource path must name an existing regular file")
+    try:
+        for component in [path, *path.parents]:
+            if component.is_symlink():
+                raise ValueError("resource path contains a symlink")
+        if not path.is_file():
+            raise ValueError("resource path must name an existing regular file")
+    except OSError:
+        raise ValueError("resource path must name an accessible regular file") from None
     return str(path)
 
 
@@ -164,7 +190,7 @@ def validate_config(config: dict) -> dict:
 
 
 def load_config(path: str | Path) -> dict:
-    return validate_config(loads(Path(path).read_bytes()))
+    return validate_config(loads(Path(path_string(path, "configuration path")).read_bytes()))
 
 
 def json_parameter(value) -> bool:

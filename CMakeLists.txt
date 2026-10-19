@@ -23,12 +23,42 @@ target_include_directories(saga_worker PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/worker/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE worker/third_party worker/src)
-target_link_libraries(saga_worker PRIVATE OpenSSL::Crypto CURL::libcurl SQLite3::SQLite3)
+target_link_libraries(saga_worker PRIVATE OpenSSL::Crypto CURL::libcurl SQLite3::SQLite3 ${CMAKE_DL_LIBS})
 target_compile_options(saga_worker PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+
+# Embed the exact executor image so static/shared consumers and relocated
+# installations use the same trusted helper without searching PATH or a host
+# executable directory.
+add_executable(saga-executor worker/src/executor_main.cpp worker/src/sandbox.cpp)
+# The embedded ELF executes from a memfd, so $ORIGIN and build-tree RPATHs
+# cannot identify an installed dependency. The coordinator supplies only the
+# canonical directory of the SQLite DSO that it has already loaded.
+set_target_properties(saga-executor PROPERTIES SKIP_BUILD_RPATH TRUE INSTALL_RPATH "")
+target_compile_features(saga-executor PRIVATE cxx_std_20)
+target_compile_definitions(saga-executor PRIVATE SAGA_EXECUTOR_ONLY)
+target_include_directories(saga-executor PRIVATE worker/include worker/third_party worker/src)
+target_link_libraries(saga-executor PRIVATE SQLite3::SQLite3)
+target_compile_options(saga-executor PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+set(executor_header "${CMAKE_CURRENT_BINARY_DIR}/generated/executor_image.hpp")
+add_custom_command(OUTPUT "${executor_header}"
+    COMMAND ${CMAKE_COMMAND} "-DINPUT=$<TARGET_FILE:saga-executor>" "-DOUTPUT=${executor_header}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed-executor.cmake.in"
+    DEPENDS saga-executor "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed-executor.cmake.in"
+    VERBATIM)
+target_sources(saga_worker PRIVATE "${executor_header}")
+target_include_directories(saga_worker PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
 add_executable(saga-worker worker/src/main.cpp)
 target_include_directories(saga-worker PRIVATE worker/third_party)
 target_link_libraries(saga-worker PRIVATE Saga::worker)
+if(BUILD_SHARED_LIBS)
+    # The installed CLI must find its own shared library after relocation,
+    # without requiring LD_LIBRARY_PATH or a system-wide ldconfig update.
+    file(RELATIVE_PATH saga_library_from_bin
+        "${CMAKE_INSTALL_FULL_BINDIR}" "${CMAKE_INSTALL_FULL_LIBDIR}")
+    set_property(TARGET saga-worker APPEND PROPERTY INSTALL_RPATH
+        "$ORIGIN/${saga_library_from_bin}")
+endif()
 
 install(TARGETS saga_worker saga-worker EXPORT SagaTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -56,4 +86,7 @@ if(BUILD_TESTING)
     target_include_directories(saga-worker-host-test PRIVATE worker/third_party)
     target_link_libraries(saga-worker-host-test PRIVATE Saga::worker Threads::Threads)
     add_test(NAME sandbox-host-boundary COMMAND saga-worker-host-test)
+    add_executable(saga-cycle-benchmark worker/tests/cycle_benchmark.cpp)
+    target_include_directories(saga-cycle-benchmark PRIVATE worker/third_party worker/src)
+    target_link_libraries(saga-cycle-benchmark PRIVATE Saga::worker)
 endif()

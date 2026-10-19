@@ -8,6 +8,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
+from .config import path_string
 from .jsonutil import dumps, loads
 
 _COMPONENT = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -27,14 +28,14 @@ def _decode(value: str) -> bytes:
 
 
 def load_private_key(value: Ed25519PrivateKey | str | Path) -> Ed25519PrivateKey:
-    key = value if isinstance(value, Ed25519PrivateKey) else serialization.load_pem_private_key(Path(value).read_bytes(), password=None)
+    key = value if isinstance(value, Ed25519PrivateKey) else serialization.load_pem_private_key(Path(path_string(value, "signing key path")).read_bytes(), password=None)
     if not isinstance(key, Ed25519PrivateKey):
         raise ValueError("Provider signing key must be Ed25519")
     return key
 
 
 def load_public_key(value: Ed25519PublicKey | str | Path) -> Ed25519PublicKey:
-    key = value if isinstance(value, Ed25519PublicKey) else serialization.load_pem_public_key(Path(value).read_bytes())
+    key = value if isinstance(value, Ed25519PublicKey) else serialization.load_pem_public_key(Path(path_string(value, "public key path")).read_bytes())
     if not isinstance(key, Ed25519PublicKey):
         raise ValueError("Provider public key must be Ed25519")
     return key

@@ -5,8 +5,10 @@
 
 namespace saga {
 
-// The coordinator owns credentials; a fresh restricted child runs each admitted
-// capability. Construct and use Worker on a single-threaded process with the
+// The coordinator owns credentials; an exec-created restricted child runs each
+// admitted capability with only its current request, neutral stdio, and a result
+// channel. Coordinator memory, environment, and other descriptors are discarded.
+// Construct and use Worker on a single-threaded process with the
 // default SIGCHLD disposition; the coordinator owns and reaps its child.
 struct WorkerConfig {
     std::string provider_url;
@@ -28,9 +30,17 @@ public:
     Worker(const Worker&) = delete;
     Worker& operator=(const Worker&) = delete;
 
-    // Takes {task_id, format, call}. Returns a JSON object with ok and result
+    // Takes {task_id, format, call, operation_id?}. Reuse operation_id after
+    // uncertainty; a known operation never receives a second admission.
+    // Returns a JSON object with ok and result
     // or error. Admission errors never run a handler.
     std::string perform(const std::string& call_record);
+
+    // Revoke outstanding delegation; returns a JSON receipt.
+    std::string revoke();
+
+    // Read durable status and the recorded result without executing a handler.
+    std::string operation_status(const std::string& operation_id);
 
 private:
     struct Impl;

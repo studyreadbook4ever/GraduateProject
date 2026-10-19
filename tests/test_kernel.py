@@ -2,8 +2,10 @@
 
 import json
 import os
+import signal
 import socket
 import subprocess
+import time
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -67,6 +69,57 @@ def test_real_filesystem_network_and_unsafe_syscalls(worker_binary, tmp_path):
     assert read_file.read_text() == "allowed read"
     assert write_file.read_text() == "after"
     assert denied_file.read_text() == "denied read"
+
+
+@pytest.mark.parametrize("phase", ["sandbox_setup", "execution"])
+def test_executor_failures_use_static_codes_without_input(worker_binary, tmp_path, phase):
+    marker = "private-input-must-not-appear-in-errors"
+    specification = {"sandbox": {"paths": [], "tcp_ports": []}, "attempts": []}
+    if phase == "sandbox_setup":
+        specification["sandbox"]["paths"] = [{"path": str(tmp_path / marker), "access": "read"}]
+    else:
+        specification["attempts"] = [{"kind": marker}]
+    document = tmp_path / "failure.json"
+    document.write_text(json.dumps(specification))
+    process = subprocess.run([str(worker_binary), "--sandbox-probe", str(document)], capture_output=True, text=True, timeout=10)
+    assert process.returncode == 0, process.stderr
+    result = json.loads(process.stdout)
+    assert result["ok"] is False
+    assert result["phase"] == phase
+    assert result["error_code"] == ("sandbox_setup_failed" if phase == "sandbox_setup" else "execution_failed")
+    assert marker not in process.stdout + process.stderr
+
+
+@pytest.mark.parametrize("interruption", [signal.SIGKILL, signal.SIGSTOP])
+def test_interrupted_executor_is_bounded_and_reaped(worker_binary, tmp_path, interruption):
+    with socket.socket() as listener, socket.socket() as pending:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(0)
+        host, port = listener.getsockname()
+        pending.connect((host, port))  # Fill the accept queue to hold the child in connect.
+        specification = {
+            "sandbox": {"paths": [], "tcp_ports": [port]},
+            "attempts": [{"kind": "tcp_connect", "host": host, "port": port}] * 5,
+        }
+        document = tmp_path / "interrupted.json"
+        document.write_text(json.dumps(specification))
+        with subprocess.Popen([str(worker_binary), "--sandbox-probe", str(document)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            deadline = time.monotonic() + 2
+            child = None
+            while time.monotonic() < deadline and process.poll() is None:
+                children = Path(f"/proc/{process.pid}/task/{process.pid}/children").read_text().split()
+                if children:
+                    child = int(children[0])
+                    break
+                time.sleep(0.001)
+            assert child is not None, "sandbox did not create its executor"
+            os.kill(child, interruption)
+            stdout, stderr = process.communicate(timeout=15)
+            assert process.returncode == 0, stderr
+            result = json.loads(stdout)
+            assert result["ok"] is False
+            assert result["error_code"] == ("executor_timeout" if interruption == signal.SIGSTOP else "executor_terminated")
+            assert not Path(f"/proc/{child}").exists(), "executor was not reaped"
 
 
 @pytest.mark.skipif(os.environ.get("SAGA_EXTERNAL_E2E") != "1", reason="external dataset experiment is opt-in: SAGA_EXTERNAL_E2E=1")

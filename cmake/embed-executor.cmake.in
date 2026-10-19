@@ -1,0 +1,5 @@
+file(READ "${INPUT}" executable HEX)
+string(REGEX REPLACE "(..)" "\\\\x\\1" executable "${executable}")
+get_filename_component(output_directory "${OUTPUT}" DIRECTORY)
+file(MAKE_DIRECTORY "${output_directory}")
+file(WRITE "${OUTPUT}" "// Generated from the trusted saga-executor target.\n#pragma once\nnamespace saga::detail::embedded {\ninline constexpr char image[] = \"${executable}\";\n}\n")
